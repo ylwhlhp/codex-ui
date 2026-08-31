@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getAvailableModelIds, getThreadDetail, listDirectoryComposioConnectors, resumeThread, startThreadTurn } from './codexGateway'
+import { getAppServerHealth, getAvailableModelIds, getThreadDetail, listDirectoryComposioConnectors, resumeThread, startThreadTurn } from './codexGateway'
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -206,6 +206,33 @@ describe('getThreadDetail', () => {
   })
 })
 
+describe('getAppServerHealth', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('reads the authenticated managed process health endpoint', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('/codex-api/health')
+      return new Response(JSON.stringify({
+        data: {
+          state: 'restarting',
+          commandSource: 'path',
+          codexHome: 'C:\\Users\\me\\.codex',
+          startedAtIso: null,
+          lastReadyAtIso: null,
+          restartAttempts: 2,
+          lastExitCode: 1,
+          lastError: 'exited',
+          stderr: [],
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getAppServerHealth()).resolves.toMatchObject({ state: 'restarting', restartAttempts: 2 })
+  })
+})
+
 describe('resumeThread', () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -233,6 +260,49 @@ describe('resumeThread', () => {
     expect(results.every((result) => result.status === 'rejected')).toBe(true)
     expect(requests).toEqual([
       { method: 'thread/resume', params: { threadId: 'missing-thread' } },
+    ])
+  })
+
+  it('falls back to thread/read when another shared client already owns the active writer', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+
+      if (body.method === 'thread/resume') {
+        return new Response(JSON.stringify({
+          error: 'thread shared-thread already has an active writer',
+        }), {
+          status: 502,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'shared-thread',
+            model: 'gpt-5.6-sol',
+            modelProvider: 'openai',
+            turns: [],
+          },
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(resumeThread('shared-thread')).resolves.toMatchObject({
+      model: 'gpt-5.6-sol',
+      modelProvider: 'openai',
+      messages: [],
+    })
+    expect(requests).toEqual([
+      { method: 'thread/resume', params: { threadId: 'shared-thread' } },
+      { method: 'thread/read', params: { threadId: 'shared-thread', includeTurns: true } },
     ])
   })
 

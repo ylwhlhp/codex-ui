@@ -25,13 +25,14 @@ import {
 import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
+import { resolveCodexHome } from '../codexHome.js'
 
-const program = new Command().name('codexui').description('Web interface for Codex app-server')
+const program = new Command().name('codexapp').description('Shared browser UI for the host Codex environment')
 const __dirname = dirname(fileURLToPath(import.meta.url))
 let hasPromptedCloudflaredInstall = false
 
 function getCodexHomePath(): string {
-  return process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+  return resolveCodexHome()
 }
 
 function getCloudflaredPromptMarkerPath(): string {
@@ -559,9 +560,9 @@ async function startServer(options: {
 
   const lines = [
     '',
-    'Codex Web Local is running!',
+    'codex-ui is running!',
     `  Version:  ${version}`,
-    '  GitHub:   https://github.com/friuns2/codexui',
+    '  GitHub:   https://github.com/ylwhlhp/codex-ui',
     '',
     `  Bind:     http://0.0.0.0:${String(port)}`,
     `  Codex sandbox: ${runtimeConfig.sandboxMode}`,
@@ -706,12 +707,12 @@ program
 
 program.command('login').description('Install/check Codex CLI and run `codex login`').action(runLogin)
 
-program.command('help').description('Show codexui command help').action(() => {
+program.command('help').description('Show codexapp command help').action(() => {
   program.outputHelp()
 })
 
 program.parseAsync(process.argv).catch((error) => {
   const message = error instanceof Error ? error.message : String(error)
-  console.error(`\nFailed to run codexui: ${message}`)
+  console.error(`\nFailed to run codexapp: ${message}`)
   process.exit(1)
 })

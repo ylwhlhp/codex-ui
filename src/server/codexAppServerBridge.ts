@@ -44,10 +44,15 @@ import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
+  resolveCodexCommandInfo,
   resolveRipgrepCommand,
 } from '../commandResolution.js'
 import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
+import { CodexProcessManager } from './codexProcessManager.js'
+import type { CodexAppServerHealth } from '../realtimeProtocol.js'
+import { DesktopStateCoordinator } from './desktopStateCoordinator.js'
+import { resolveCodexHome } from '../codexHome.js'
 
 type JsonRpcCall = {
   jsonrpc: '2.0'
@@ -4050,8 +4055,7 @@ async function listFilesWithRipgrep(cwd: string): Promise<string[]> {
 }
 
 function getCodexHomeDir(): string {
-  const codexHome = process.env.CODEX_HOME?.trim()
-  return codexHome && codexHome.length > 0 ? codexHome : join(homedir(), '.codex')
+  return resolveCodexHome()
 }
 
 function getSkillsInstallDir(): string {
@@ -6372,6 +6376,7 @@ const MERGEABLE_ITEM_TYPES = new Set([
 
 class AppServerProcess {
   private process: ChildProcessWithoutNullStreams | null = null
+  private readonly processManager = new CodexProcessManager()
   private initialized = false
   private initializePromise: Promise<void> | null = null
   private readBuffer = ''
@@ -6390,10 +6395,12 @@ class AppServerProcess {
   private activeConfigSignature = ''
 
 
-  private getCodexCommand(): string {
-    const codexCommand = resolveCodexCommand()
+  private getCodexCommand() {
+    const codexCommand = resolveCodexCommandInfo()
     if (!codexCommand) {
-      throw new Error('Codex CLI is not available. Install @openai/codex or set CODEXUI_CODEX_COMMAND.')
+      const message = 'Codex CLI is not available. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
+      this.processManager.reportUnavailable(getCodexHomeDir(), message)
+      throw new Error(message)
     }
     return codexCommand
   }
@@ -6439,11 +6446,20 @@ class AppServerProcess {
     this.stopping = false
     const config = this.buildAppServerConfig()
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
-    const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
+    const codexCommand = this.getCodexCommand()
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
       : undefined
-    const proc = spawn(invocation.command, invocation.args, { stdio: ['pipe', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) })
+    this.processManager.start({
+      command: codexCommand.command,
+      args: config.args,
+      ...(spawnEnv ? { env: spawnEnv } : {}),
+      commandSource: codexCommand.source,
+      codexHome: getCodexHomeDir(),
+    }, (proc) => this.attachProcess(proc))
+  }
+
+  private attachProcess(proc: ChildProcessWithoutNullStreams): void {
     this.process = proc
 
     proc.stdout.setEncoding('utf8')
@@ -6463,11 +6479,6 @@ class AppServerProcess {
       }
     })
 
-    proc.stderr.setEncoding('utf8')
-    proc.stderr.on('data', () => {
-      // Keep stderr silent in dev middleware; JSON-RPC errors are forwarded via responses.
-    })
-
     proc.on('exit', () => {
       if (this.process !== proc) {
         return
@@ -6485,6 +6496,13 @@ class AppServerProcess {
       this.initializePromise = null
       this.readBuffer = ''
     })
+
+    if (this.processManager.getHealth().restartAttempts > 0) {
+      queueMicrotask(() => {
+        if (this.stopping) return
+        void this.ensureInitialized().catch(() => {})
+      })
+    }
   }
 
   private sendLine(payload: Record<string, unknown>): void {
@@ -6821,6 +6839,7 @@ class AppServerProcess {
 
   private async call(method: string, params: unknown): Promise<unknown> {
     this.start()
+    await this.processManager.waitForProcess()
     const id = this.nextId++
 
     return new Promise((resolve, reject) => {
@@ -6856,6 +6875,7 @@ class AppServerProcess {
         method: 'initialized',
       })
       this.initialized = true
+      this.processManager.markReady()
     }).finally(() => {
       this.initializePromise = null
     })
@@ -6874,6 +6894,14 @@ class AppServerProcess {
     return () => {
       this.notificationListeners.delete(listener)
     }
+  }
+
+  getHealth(): CodexAppServerHealth {
+    return this.processManager.getHealth()
+  }
+
+  onHealthChange(listener: (health: CodexAppServerHealth) => void): () => void {
+    return this.processManager.subscribeHealth(listener)
   }
 
   async respondToServerRequest(payload: unknown): Promise<void> {
@@ -6913,11 +6941,10 @@ class AppServerProcess {
   }
 
   dispose(): void {
-    if (!this.process) return
-
     const proc = this.process
     this.stopping = true
     this.process = null
+    this.processManager.stop()
     this.initialized = false
     this.initializePromise = null
     this.activeConfigSignature = ''
@@ -6930,17 +6957,7 @@ class AppServerProcess {
     this.pending.clear()
     this.pendingServerRequests.clear()
 
-    try {
-      proc.stdin.end()
-    } catch {
-      // ignore close errors on shutdown
-    }
-
-    try {
-      proc.kill('SIGTERM')
-    } catch {
-      // ignore kill errors on shutdown
-    }
+    if (!proc) return
 
     const forceKillTimer = setTimeout(() => {
       if (!proc.killed) {
@@ -7311,9 +7328,13 @@ class MethodCatalog {
   }
 }
 
-type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
+export type CodexBridgeNotification = { method: string; params: unknown; atIso: string }
+
+export type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
   dispose: () => void
-  subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
+  subscribeNotifications: (listener: (value: CodexBridgeNotification) => void) => () => void
+  getHealth: () => CodexAppServerHealth
+  getRealtimeRevision: () => number
 }
 
 type SharedBridgeState = {
@@ -7323,10 +7344,13 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  desktopStateCoordinator: DesktopStateCoordinator
+  unsubscribeDesktopStateSource: () => void
+  unsubscribeProcessHealthSource: () => void
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v3'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7341,17 +7365,31 @@ function getSharedBridgeState(): SharedBridgeState {
     existing.appServer.dispose()
     existing.backendQueueProcessor?.dispose()
     existing.terminalManager?.dispose()
+    existing.unsubscribeDesktopStateSource?.()
+    existing.unsubscribeProcessHealthSource?.()
+    existing.desktopStateCoordinator?.stop()
   }
 
   const appServer = new AppServerProcess()
   const terminalManager = new ThreadTerminalManager()
   const backendQueueProcessor = new BackendQueueProcessor(appServer)
+  const desktopStateCoordinator = new DesktopStateCoordinator({ codexHome: getCodexHomeDir() })
+  const unsubscribeDesktopStateSource = appServer.onNotification((notification) => {
+    desktopStateCoordinator.noteNativeNotification(notification)
+  })
+  const unsubscribeProcessHealthSource = appServer.onHealthChange((health) => {
+    desktopStateCoordinator.noteProcessHealth(health.state)
+  })
+  desktopStateCoordinator.start()
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
+    desktopStateCoordinator,
+    unsubscribeDesktopStateSource,
+    unsubscribeProcessHealthSource,
     telegramBridge: new TelegramThreadBridge(appServer, {
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})
@@ -7439,7 +7477,15 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 }
 
 export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+  const {
+    appServer,
+    terminalManager,
+    methodCatalog,
+    telegramBridge,
+    backendQueueProcessor,
+    desktopStateCoordinator,
+  } = getSharedBridgeState()
+  desktopStateCoordinator.start()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -9599,7 +9645,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           res.write(`data: ${JSON.stringify(notification)}\n\n`)
         })
 
-        res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`)
+        res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, revision: desktopStateCoordinator.getRevision() })}\n\n`)
         const keepAlive = setInterval(() => {
           res.write(': ping\n\n')
         }, 15000)
@@ -9629,10 +9675,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
+    desktopStateCoordinator.stop()
     appServer.dispose()
   }
   middleware.subscribeNotifications = (
-    listener: (value: { method: string; params: unknown; atIso: string }) => void,
+    listener: (value: CodexBridgeNotification) => void,
   ) => {
     const unsubscribeAppServer = appServer.onNotification((notification: { method: string; params: unknown }) => {
       listener({
@@ -9646,11 +9693,23 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         atIso: new Date().toISOString(),
       })
     })
+    const unsubscribeDesktopState = desktopStateCoordinator.subscribe(listener)
+    const unsubscribeHealth = appServer.onHealthChange((health) => {
+      listener({
+        method: 'codex-ui/app-server-health',
+        params: health,
+        atIso: new Date().toISOString(),
+      })
+    })
     return () => {
       unsubscribeAppServer()
       unsubscribeTerminal()
+      unsubscribeDesktopState()
+      unsubscribeHealth()
     }
   }
+  middleware.getHealth = () => appServer.getHealth()
+  middleware.getRealtimeRevision = () => desktopStateCoordinator.getRevision()
 
   return middleware
 }

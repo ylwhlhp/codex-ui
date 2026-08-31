@@ -20,7 +20,8 @@ import type {
   ThreadStartResponse,
   Turn,
 } from './appServerDtos'
-import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
+import { CodexApiError, extractErrorMessage, normalizeCodexApiError } from './codexErrors'
+import type { CodexAppServerHealth } from '../realtimeProtocol'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
@@ -425,6 +426,27 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null
+}
+
+export async function getAppServerHealth(): Promise<CodexAppServerHealth> {
+  const response = await fetch('/codex-api/health')
+  let payload: unknown = null
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+  if (!response.ok) {
+    throw new CodexApiError(
+      extractErrorMessage(payload, `App-server health failed with HTTP ${String(response.status)}`),
+      { code: 'http_error', status: response.status },
+    )
+  }
+  const data = asRecord(asRecord(payload)?.data)
+  if (!data) {
+    throw new CodexApiError('App-server health returned malformed data', { code: 'invalid_response' })
+  }
+  return data as CodexAppServerHealth
 }
 
 function readString(value: unknown): string | null {
@@ -1515,7 +1537,20 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
   if (existing) return existing
 
   const promise = (async () => {
-    const payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
+    let payload: ThreadReadResponse
+    try {
+      payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
+    } catch (error) {
+      const isActiveWriterConflict = error instanceof CodexApiError
+        && error.status === 502
+        && error.message.includes('already has an active writer')
+      if (!isActiveWriterConflict) throw error
+
+      payload = await callRpc<ThreadReadResponse>('thread/read', {
+        threadId,
+        includeTurns: true,
+      })
+    }
     const startTurnIndex = readThreadTurnStartIndex(payload)
     const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
     return {
@@ -1641,9 +1676,12 @@ function normalizeThreadCwdFromPayload(payload: unknown): string {
 }
 
 function normalizeThreadModelFromPayload(payload: unknown): string {
-  if (!payload || typeof payload !== 'object') return ''
-  const model = (payload as Record<string, unknown>).model
-  return typeof model === 'string' ? model.trim() : ''
+  const record = asRecord(payload)
+  if (!record) return ''
+  const model = readString(record.model)?.trim() ?? ''
+  if (model) return model
+  const thread = asRecord(record.thread)
+  return readString(thread?.model)?.trim() ?? ''
 }
 
 function normalizeThreadModelProviderFromPayload(payload: unknown): string {

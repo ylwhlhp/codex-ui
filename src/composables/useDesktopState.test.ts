@@ -152,6 +152,45 @@ afterEach(() => {
 })
 
 describe('filterGroupsByWorkspaceRoots', () => {
+  it('uses Desktop project assignments, project order, and projectless thread ids', () => {
+    const groups: UiProjectGroup[] = [
+      {
+        projectName: 'shared',
+        threads: [
+          thread('thread-alpha', '/tmp/shared'),
+          thread('thread-beta', '/tmp/shared'),
+          thread('thread-projectless', '/tmp/shared'),
+        ],
+      },
+    ]
+    const rootsState: WorkspaceRootsState = {
+      order: [],
+      labels: {},
+      active: [],
+      projectOrder: ['local-beta', 'local-alpha', 'local-empty'],
+      localProjects: [
+        { id: 'local-alpha', name: 'Alpha', rootPaths: ['/tmp/alpha'] },
+        { id: 'local-beta', name: 'Beta', rootPaths: ['/tmp/beta'] },
+        { id: 'local-empty', name: 'Empty project', rootPaths: ['/tmp/empty'] },
+      ],
+      threadProjectAssignments: {
+        'thread-alpha': { projectKind: 'local', projectId: 'local-alpha' },
+        'thread-beta': { projectKind: 'local', projectId: 'local-beta' },
+      },
+      projectlessThreadIds: ['thread-projectless'],
+    }
+
+    expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => [
+      group.projectName,
+      group.threads.map((row) => [row.id, row.projectName]),
+    ])).toEqual([
+      ['local-beta', [['thread-beta', 'local-beta']]],
+      ['local-alpha', [['thread-alpha', 'local-alpha']]],
+      ['Projectless', [['thread-projectless', 'Projectless']]],
+      ['local-empty', []],
+    ])
+  })
+
   it('keeps projectless chats visible when workspace roots are configured', () => {
     const groups: UiProjectGroup[] = [
       {
@@ -766,6 +805,56 @@ describe('startup request deduplication', () => {
     await timers.advanceBy(350)
 
     expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(1)
+  })
+
+  it('updates Desktop local project names after a realtime projects invalidation', async () => {
+    installImmediateTimers()
+    let notificationHandler: ((notification: { method: string; params?: unknown; atIso?: string }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getWorkspaceRootsState
+      .mockResolvedValueOnce({
+        order: [],
+        labels: {},
+        active: [],
+        projectOrder: ['local-project'],
+        localProjects: [{ id: 'local-project', name: 'Alpha', rootPaths: ['/tmp/project'] }],
+        threadProjectAssignments: {
+          'thread-1': { projectKind: 'local', projectId: 'local-project' },
+        },
+        projectlessThreadIds: [],
+      })
+      .mockResolvedValueOnce({
+        order: [],
+        labels: {},
+        active: [],
+        projectOrder: ['local-project'],
+        localProjects: [{ id: 'local-project', name: 'Beta', rootPaths: ['/tmp/project'] }],
+        threadProjectAssignments: {
+          'thread-1': { projectKind: 'local', projectId: 'local-project' },
+        },
+        projectlessThreadIds: [],
+      })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    expect(state.projectDisplayNameById.value['local-project']).toBe('Alpha')
+
+    state.startPolling()
+    notificationHandler?.({
+      method: 'codex-ui/state-invalidated',
+      params: { scopes: ['projects'], reason: 'filesystem', revision: 1 },
+      atIso: '2026-08-31T00:00:00.000Z',
+    })
+    await flushRealtimeTasks()
+
+    expect(state.projectDisplayNameById.value['local-project']).toBe('Beta')
   })
 
   it('forces one recovery refresh when ready reports a newer revision', async () => {

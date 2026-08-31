@@ -1,5 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getAppServerHealth, getAvailableModelIds, getThreadDetail, listDirectoryComposioConnectors, resumeThread, startThreadTurn } from './codexGateway'
+import {
+  getAppServerHealth,
+  getAvailableModelIds,
+  getThreadDetail,
+  getWorkspaceRootsState,
+  listDirectoryComposioConnectors,
+  resumeThread,
+  startThreadTurn,
+  subscribeCodexNotifications,
+} from './codexGateway'
+
+const rpcClientMocks = vi.hoisted(() => ({
+  subscribeRpcNotifications: vi.fn(),
+}))
+
+vi.mock('./codexRpcClient', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./codexRpcClient')>(),
+  subscribeRpcNotifications: rpcClientMocks.subscribeRpcNotifications,
+}))
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -27,6 +45,51 @@ function mockRpcFetch(): { requests: Array<{ method: string, params: Record<stri
 
   return { requests }
 }
+
+describe('workspace roots state cache', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    rpcClientMocks.subscribeRpcNotifications.mockReset()
+  })
+
+  it('reloads Desktop project metadata after a realtime projects invalidation', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    rpcClientMocks.subscribeRpcNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    let requestCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      requestCount += 1
+      const projectName = requestCount === 1 ? 'Alpha' : 'Beta'
+      return new Response(JSON.stringify({
+        data: {
+          order: [],
+          labels: {},
+          active: [],
+          projectOrder: ['local-project'],
+          remoteProjects: [],
+          localProjects: [{ id: 'local-project', name: projectName, rootPaths: ['/tmp/project'] }],
+          threadProjectAssignments: {},
+          projectlessThreadIds: [],
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    subscribeCodexNotifications(vi.fn())
+    expect((await getWorkspaceRootsState()).localProjects?.[0]?.name).toBe('Alpha')
+    notificationHandler?.({
+      method: 'codex-ui/state-invalidated',
+      params: { scopes: ['projects'], reason: 'filesystem', revision: 1 },
+    })
+
+    expect((await getWorkspaceRootsState()).localProjects?.[0]?.name).toBe('Beta')
+    expect(requestCount).toBe(2)
+  })
+})
 
 describe('startThreadTurn collaboration mode payloads', () => {
   afterEach(() => {

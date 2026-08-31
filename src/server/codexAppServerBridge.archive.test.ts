@@ -156,6 +156,33 @@ describe('buildProjectlessFolderName', () => {
 })
 
 describe('canonicalizeWorkspaceRootsStateForRead', () => {
+  it('preserves modern Desktop project metadata used to organize threads', async () => {
+    const state = await canonicalizeWorkspaceRootsStateForRead({
+      order: ['/workspace/alpha'],
+      labels: {},
+      active: ['/workspace/alpha'],
+      projectOrder: ['local-beta', 'local-alpha'],
+      remoteProjects: [],
+      localProjects: [
+        { id: 'local-alpha', name: 'Alpha', rootPaths: ['/workspace/alpha'] },
+        { id: 'local-beta', name: 'Beta', rootPaths: ['/workspace/beta'] },
+      ],
+      threadProjectAssignments: {
+        'thread-alpha': { projectKind: 'local', projectId: 'local-alpha' },
+      },
+      projectlessThreadIds: ['thread-projectless'],
+    })
+
+    expect(state.localProjects).toEqual([
+      { id: 'local-alpha', name: 'Alpha', rootPaths: ['/workspace/alpha'] },
+      { id: 'local-beta', name: 'Beta', rootPaths: ['/workspace/beta'] },
+    ])
+    expect(state.threadProjectAssignments).toEqual({
+      'thread-alpha': { projectKind: 'local', projectId: 'local-alpha' },
+    })
+    expect(state.projectlessThreadIds).toEqual(['thread-projectless'])
+  })
+
   it('realpaths existing local roots so symlink cwd sessions remain visible', async () => {
     const state = await canonicalizeWorkspaceRootsStateForRead({
       order: ['/workspace-link/projects/demo', 'remote-project-id'],

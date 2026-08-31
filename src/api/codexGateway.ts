@@ -279,6 +279,16 @@ export type WorkspaceRootsState = {
     remotePath: string
     label: string
   }>
+  localProjects?: Array<{
+    id: string
+    name: string
+    rootPaths: string[]
+  }>
+  threadProjectAssignments?: Record<string, {
+    projectKind: string
+    projectId: string
+  }>
+  projectlessThreadIds?: string[]
 }
 
 let workspaceRootsStatePromise: Promise<WorkspaceRootsState> | null = null
@@ -1299,7 +1309,18 @@ export async function runThreadAutomationNow(threadId: string, automationId: str
 }
 
 export function subscribeCodexNotifications(onNotification: (value: RpcNotification) => void): () => void {
-  return subscribeRpcNotifications(onNotification)
+  return subscribeRpcNotifications((notification) => {
+    if (notification.method === 'codex-ui/state-invalidated') {
+      const params = notification.params && typeof notification.params === 'object' && !Array.isArray(notification.params)
+        ? notification.params as Record<string, unknown>
+        : {}
+      const scopes = Array.isArray(params.scopes) ? params.scopes : []
+      if (scopes.includes('projects')) {
+        invalidateWorkspaceRootsStateCache()
+      }
+    }
+    onNotification(notification)
+  })
 }
 
 export type { RpcNotification }
@@ -2538,6 +2559,33 @@ function normalizeWorkspaceRootsState(payload: unknown): WorkspaceRootsState {
     }
   }
 
+  const localProjects = Array.isArray(record.localProjects)
+    ? record.localProjects.flatMap((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+      const project = item as Record<string, unknown>
+      const id = typeof project.id === 'string' ? project.id.trim() : ''
+      if (!id) return []
+      return [{
+        id,
+        name: typeof project.name === 'string' ? project.name.trim() : '',
+        rootPaths: normalizeArray(project.rootPaths).map((value) => normalizePathForUi(value)),
+      }]
+    })
+    : []
+  const threadProjectAssignments: NonNullable<WorkspaceRootsState['threadProjectAssignments']> = {}
+  if (record.threadProjectAssignments && typeof record.threadProjectAssignments === 'object' && !Array.isArray(record.threadProjectAssignments)) {
+    for (const [threadId, item] of Object.entries(record.threadProjectAssignments as Record<string, unknown>)) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      const assignment = item as Record<string, unknown>
+      const projectId = typeof assignment.projectId === 'string' ? assignment.projectId.trim() : ''
+      if (!threadId.trim() || !projectId) continue
+      threadProjectAssignments[threadId] = {
+        projectKind: typeof assignment.projectKind === 'string' ? assignment.projectKind.trim() : '',
+        projectId,
+      }
+    }
+  }
+
   return {
     order: normalizeArray(record.order).map((value) => normalizePathForUi(value)),
     labels,
@@ -2557,6 +2605,9 @@ function normalizeWorkspaceRootsState(payload: unknown): WorkspaceRootsState {
         }]
       })
       : [],
+    localProjects,
+    threadProjectAssignments,
+    projectlessThreadIds: normalizeArray(record.projectlessThreadIds),
   }
 }
 
@@ -2653,6 +2704,11 @@ function cloneWorkspaceRootsState(state: WorkspaceRootsState): WorkspaceRootsSta
     active: [...state.active],
     projectOrder: [...state.projectOrder],
     remoteProjects: state.remoteProjects?.map((item) => ({ ...item })) ?? [],
+    localProjects: state.localProjects?.map((item) => ({ ...item, rootPaths: [...item.rootPaths] })) ?? [],
+    threadProjectAssignments: Object.fromEntries(
+      Object.entries(state.threadProjectAssignments ?? {}).map(([threadId, assignment]) => [threadId, { ...assignment }]),
+    ),
+    projectlessThreadIds: [...(state.projectlessThreadIds ?? [])],
   }
 }
 

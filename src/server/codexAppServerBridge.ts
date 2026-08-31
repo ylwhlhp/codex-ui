@@ -100,6 +100,16 @@ export type WorkspaceRootsState = {
     remotePath: string
     label: string
   }>
+  localProjects?: Array<{
+    id: string
+    name: string
+    rootPaths: string[]
+  }>
+  threadProjectAssignments?: Record<string, {
+    projectKind: string
+    projectId: string
+  }>
+  projectlessThreadIds?: string[]
 }
 
 type PendingServerRequest = {
@@ -4545,6 +4555,43 @@ function normalizeRemoteProjects(value: unknown): WorkspaceRootsState['remotePro
   return next
 }
 
+function normalizeLocalProjects(value: unknown): NonNullable<WorkspaceRootsState['localProjects']> {
+  const rows = Array.isArray(value)
+    ? value
+    : Object.values(asRecord(value) ?? {})
+  const next: NonNullable<WorkspaceRootsState['localProjects']> = []
+  const seen = new Set<string>()
+  for (const item of rows) {
+    const record = asRecord(item)
+    if (!record) continue
+    const id = typeof record.id === 'string' ? record.id.trim() : ''
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    next.push({
+      id,
+      name: typeof record.name === 'string' ? record.name.trim() : '',
+      rootPaths: normalizeStringArray(record.rootPaths),
+    })
+  }
+  return next
+}
+
+function normalizeThreadProjectAssignments(
+  value: unknown,
+): NonNullable<WorkspaceRootsState['threadProjectAssignments']> {
+  const assignments: NonNullable<WorkspaceRootsState['threadProjectAssignments']> = {}
+  for (const [threadId, item] of Object.entries(asRecord(value) ?? {})) {
+    const record = asRecord(item)
+    const projectId = typeof record?.projectId === 'string' ? record.projectId.trim() : ''
+    if (!threadId.trim() || !projectId) continue
+    assignments[threadId] = {
+      projectKind: typeof record?.projectKind === 'string' ? record.projectKind.trim() : '',
+      projectId,
+    }
+  }
+  return assignments
+}
+
 
 
 function getCodexAuthPath(): string {
@@ -5888,10 +5935,14 @@ export async function canonicalizeWorkspaceRootsState(
   state: WorkspaceRootsState,
   pathRealpath: PathRealpathResolver = realpath,
 ): Promise<WorkspaceRootsState> {
-  const [order, active, projectOrder] = await Promise.all([
+  const [order, active, projectOrder, localProjects] = await Promise.all([
     canonicalizeWorkspaceRootPathList(state.order, pathRealpath),
     canonicalizeWorkspaceRootPathList(state.active, pathRealpath),
     canonicalizeWorkspaceRootPathList(state.projectOrder, pathRealpath),
+    Promise.all((state.localProjects ?? []).map(async (project) => ({
+      ...project,
+      rootPaths: await canonicalizeWorkspaceRootPathList(project.rootPaths, pathRealpath),
+    }))),
   ])
   const labelEntries = await Promise.all(
     Object.entries(state.labels)
@@ -5923,6 +5974,14 @@ export async function canonicalizeWorkspaceRootsState(
     active,
     projectOrder,
     remoteProjects: state.remoteProjects.map((project) => ({ ...project })),
+    localProjects,
+    threadProjectAssignments: Object.fromEntries(
+      Object.entries(state.threadProjectAssignments ?? {}).map(([threadId, assignment]) => [
+        threadId,
+        { ...assignment },
+      ]),
+    ),
+    projectlessThreadIds: [...(state.projectlessThreadIds ?? [])],
   }
 }
 
@@ -5983,6 +6042,9 @@ async function readWorkspaceRootsState(): Promise<WorkspaceRootsState> {
     active: normalizeStringArray(payload['active-workspace-roots']),
     projectOrder: normalizeStringArray(payload['project-order']),
     remoteProjects: normalizeRemoteProjects(payload['remote-projects']),
+    localProjects: normalizeLocalProjects(payload['local-projects']),
+    threadProjectAssignments: normalizeThreadProjectAssignments(payload['thread-project-assignments']),
+    projectlessThreadIds: normalizeStringArray(payload['projectless-thread-ids']),
   })
 }
 

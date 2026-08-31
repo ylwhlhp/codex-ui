@@ -24,10 +24,14 @@ Synchronize the host Codex desktop with two authenticated browser clients while 
 11. While the child restarts, confirm both browsers keep their cached projects, sessions, and selected messages visible.
 12. Confirm the header health state changes to reconnecting or unavailable, then returns to `Codex connected` after automatic recovery.
 13. Create or rename one more desktop session and confirm both browsers converge again without reload.
-14. Repeat the visible status and session checks in light and dark themes at `1440x900` and `375x812`.
+14. In Codex desktop, create an empty local project, rename another local project, change project order, and move a session between the projects.
+15. Confirm both browsers show the desktop project names and order, keep the empty project visible, and move the session to the same project without reload.
+16. Move a session to desktop Chats (projectless) and confirm it leaves the project tree and appears in the browser Chats section.
+17. Repeat the visible status and session checks in light and dark themes at `1440x900` and `375x812`.
 
 #### Expected Results
 - Desktop filesystem/native app-server signals converge in both authenticated browsers in real time.
+- Desktop `local-projects`, `thread-project-assignments`, `project-order`, and `projectless-thread-ids` are reflected in both browser sidebars.
 - A second client can open a session already resumed by another client; only the explicit active-writer conflict falls back to `thread/read`.
 - Duplicate/lower invalidation revisions do not cause duplicate list or selected-thread requests.
 - A reconnect `ready` revision forces recovery when browser state may be stale.

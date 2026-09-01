@@ -1552,26 +1552,16 @@ export type ResumedThread = {
 
 const RESUME_THREAD_COALESCE_TTL_MS = 30_000
 const recentResumeThreadById = new Map<string, Promise<ResumedThread>>()
+const pendingThreadReleaseById = new Map<string, Promise<void>>()
 
 export async function resumeThread(threadId: string): Promise<ResumedThread> {
   const existing = recentResumeThreadById.get(threadId)
   if (existing) return existing
 
   const promise = (async () => {
-    let payload: ThreadReadResponse
-    try {
-      payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
-    } catch (error) {
-      const isActiveWriterConflict = error instanceof CodexApiError
-        && error.status === 502
-        && error.message.includes('already has an active writer')
-      if (!isActiveWriterConflict) throw error
-
-      payload = await callRpc<ThreadReadResponse>('thread/read', {
-        threadId,
-        includeTurns: true,
-      })
-    }
+    const pendingRelease = pendingThreadReleaseById.get(threadId)
+    if (pendingRelease) await pendingRelease
+    const payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
     const startTurnIndex = readThreadTurnStartIndex(payload)
     const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
     return {
@@ -1600,6 +1590,26 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
     }, 2000)
   }).catch(() => undefined)
   return promise
+}
+
+export async function releaseThreadWriter(threadId: string): Promise<void> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) return
+
+  recentResumeThreadById.delete(normalizedThreadId)
+  const existing = pendingThreadReleaseById.get(normalizedThreadId)
+  if (existing) return existing
+
+  const promise = callRpc('codex-ui/thread/release', { threadId: normalizedThreadId })
+    .then(() => undefined)
+  pendingThreadReleaseById.set(normalizedThreadId, promise)
+  try {
+    await promise
+  } finally {
+    if (pendingThreadReleaseById.get(normalizedThreadId) === promise) {
+      pendingThreadReleaseById.delete(normalizedThreadId)
+    }
+  }
 }
 
 export async function archiveThread(threadId: string): Promise<void> {
@@ -1964,7 +1974,7 @@ export async function startThreadTurn(
         },
       }
     }
-    const payload = await callRpc<{ turn?: Turn }>('turn/start', params)
+    const payload = await callRpc<{ turn?: Turn }>('codex-ui/turn/start', params)
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to start turn for thread ${threadId}`, 'turn/start')

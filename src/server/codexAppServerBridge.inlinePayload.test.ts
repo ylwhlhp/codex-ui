@@ -358,7 +358,7 @@ describe('backend queue scheduling', () => {
     vi.useFakeTimers()
     const processor = new BackendQueueProcessor({
       onNotification: () => () => undefined,
-    } as never)
+    } as never, {} as never)
     const processThreadQueue = vi
       .spyOn(processor as unknown as { processThreadQueue: (threadId: string) => Promise<void> }, 'processThreadQueue')
       .mockResolvedValue(undefined)

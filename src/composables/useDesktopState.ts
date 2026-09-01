@@ -16,6 +16,7 @@ import {
   getBackgroundThreadListLimit,
   interruptThreadTurn,
   pickCodexRateLimitSnapshot,
+  releaseThreadWriter,
   replyToServerRequest,
   revertThreadFileChanges,
   rollbackThread,
@@ -28,7 +29,6 @@ import {
   getThreadTitleCache,
   persistThreadTitle,
   generateThreadTitle,
-  resumeThread,
 
   startThread,
   subscribeCodexNotifications,
@@ -62,7 +62,13 @@ import type {
   UiTokenUsageBreakdown,
   UiThread,
 } from '../types/codex'
-import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import {
+  getPathParent,
+  isProjectlessChatPath,
+  normalizePathForComparison,
+  normalizePathForUi,
+  toProjectName,
+} from '../pathUtils.js'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -1397,16 +1403,31 @@ function applyDesktopProjectAssignments(
 ): UiProjectGroup[] {
   const assignments = rootsState?.threadProjectAssignments ?? {}
   const projectlessThreadIds = new Set(rootsState?.projectlessThreadIds ?? [])
-  if (Object.keys(assignments).length === 0 && projectlessThreadIds.size === 0) return groups
+  const localProjectIdByRootPath = new Map<string, string>()
+  for (const project of rootsState?.localProjects ?? []) {
+    for (const rootPath of project.rootPaths) {
+      const comparableRootPath = normalizePathForComparison(rootPath).replace(/\/+$/u, '')
+      if (comparableRootPath && !localProjectIdByRootPath.has(comparableRootPath)) {
+        localProjectIdByRootPath.set(comparableRootPath, project.id)
+      }
+    }
+  }
+  if (
+    Object.keys(assignments).length === 0
+    && projectlessThreadIds.size === 0
+    && localProjectIdByRootPath.size === 0
+  ) return groups
 
   const nextGroups: UiProjectGroup[] = []
   const groupsByProjectName = new Map<string, UiProjectGroup>()
   for (const group of groups) {
     for (const thread of group.threads) {
       const assignment = assignments[thread.id]
+      const comparableThreadCwd = normalizePathForComparison(thread.cwd).replace(/\/+$/u, '')
+      const localProjectId = localProjectIdByRootPath.get(comparableThreadCwd)
       const projectName = projectlessThreadIds.has(thread.id)
         ? 'Projectless'
-        : assignment?.projectId || group.projectName
+        : assignment?.projectId || localProjectId || group.projectName
       const nextThread = thread.projectName === projectName ? thread : { ...thread, projectName }
       const existingGroup = groupsByProjectName.get(projectName)
       if (existingGroup) {
@@ -1496,7 +1517,6 @@ export function useDesktopState() {
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
-  const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
   const turnSummaryByThreadId = ref<Record<string, TurnSummaryState>>({})
   const turnActivityByThreadId = ref<Record<string, TurnActivityState>>({})
@@ -1899,6 +1919,19 @@ export function useDesktopState() {
     pendingTurnRequestByThreadId.value = omitKey(pendingTurnRequestByThreadId.value, threadId)
   }
 
+  async function releaseThreadWriterBestEffort(threadId: string): Promise<void> {
+    if (!threadId.trim()) return
+    try {
+      await releaseThreadWriter(threadId)
+    } catch (unknownError) {
+      const errorMessage = unknownError instanceof Error
+        ? unknownError.message
+        : `Failed to release thread ${threadId}`
+      setTurnErrorForThread(threadId, errorMessage)
+      error.value = errorMessage
+    }
+  }
+
 
 
   async function retryPendingTurnWithFallback(threadId: string): Promise<void> {
@@ -1935,20 +1968,6 @@ export function useDesktopState() {
         details: buildPendingTurnDetails(MODEL_FALLBACK_ID, pending.effort, pending.collaborationMode),
       })
       setThreadInProgress(threadId, true)
-
-      if (resumedThreadById.value[threadId] !== true) {
-        const resumedThread = await resumeThread(threadId)
-        if (resumedThread.model) {
-          setThreadModelId(threadId, resolveThreadModelForProvider(threadId, resumedThread.model, resumedThread.modelProvider))
-        }
-        if (resumedThread.modelProvider) {
-          setThreadModelProviderId(threadId, resumedThread.modelProvider)
-        }
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
-        }
-      }
 
       await startThreadTurn(
         threadId,
@@ -2300,7 +2319,6 @@ export function useDesktopState() {
     }
     loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, activeThreadIds)
     loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, activeThreadIds)
-    resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
     liveAgentMessagesByThreadId.value = pruneThreadStateMap(liveAgentMessagesByThreadId.value, activeThreadIds)
@@ -4508,9 +4526,7 @@ export function useDesktopState() {
         return
       }
 
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const resumedThread = needsResume ? await resumeThread(threadId) : null
-      const detail = resumedThread ?? await getThreadDetail(threadId)
+      const detail = await getThreadDetail(threadId)
 
       if (detail.modelProvider) {
         setThreadModelProviderId(threadId, detail.modelProvider)
@@ -4518,13 +4534,6 @@ export function useDesktopState() {
       if (detail.model) {
         setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
       }
-      if (resumedThread) {
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
-        }
-      }
-
       const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
@@ -4815,23 +4824,22 @@ export function useDesktopState() {
     const sourceTitle = sourceThread?.title?.trim() ?? 'Forked chat'
     const selectedModel = readModelIdForThread(sourceThreadId)
     error.value = ''
+    let nextThreadId = ''
 
     try {
       const forkedThread = await forkThread(sourceThreadId, sourceCwd || undefined, selectedModel || undefined)
-      const nextThreadId = forkedThread.threadId.trim()
+      nextThreadId = forkedThread.threadId.trim()
       if (!nextThreadId) return ''
 
       insertOptimisticThread(nextThreadId, sourceCwd, sourceTitle)
       setThreadModelId(nextThreadId, forkedThread.model)
-      resumedThreadById.value = {
-        ...resumedThreadById.value,
-        [nextThreadId]: true,
-      }
       setSelectedThreadId(nextThreadId)
       await loadThreads()
       await loadMessages(nextThreadId)
+      await releaseThreadWriterBestEffort(nextThreadId)
       return nextThreadId
     } catch (unknownError) {
+      await releaseThreadWriterBestEffort(nextThreadId)
       error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       return ''
     }
@@ -4866,11 +4874,12 @@ export function useDesktopState() {
     if (lastTurnIndex >= 0 && turnIndex > lastTurnIndex) return ''
 
     const sourceThread = flattenThreads(sourceGroups.value).find((row) => row.id === normalizedThreadId) ?? null
+    let forkedThreadId = ''
 
     try {
       error.value = ''
       const forked = await forkThread(normalizedThreadId)
-      const forkedThreadId = forked.threadId.trim()
+      forkedThreadId = forked.threadId.trim()
       if (!forkedThreadId) return ''
 
       const forkedCwd = forked.cwd.trim() || sourceThread?.cwd?.trim() || ''
@@ -4880,10 +4889,6 @@ export function useDesktopState() {
       setPersistedMessagesForThread(forkedThreadId, forked.messages)
       loadedMessagesByThreadId.value = {
         ...loadedMessagesByThreadId.value,
-        [forkedThreadId]: true,
-      }
-      resumedThreadById.value = {
-        ...resumedThreadById.value,
         [forkedThreadId]: true,
       }
       clearLivePlansForThread(forkedThreadId)
@@ -4906,8 +4911,10 @@ export function useDesktopState() {
       await renameThreadById(forkedThreadId, forkedThreadTitle)
       setSelectedThreadId(forkedThreadId)
       void loadThreads().catch(() => {})
+      await releaseThreadWriterBestEffort(forkedThreadId)
       return forkedThreadId
     } catch (unknownError) {
+      await releaseThreadWriterBestEffort(forkedThreadId)
       error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       return ''
     }
@@ -5092,10 +5099,6 @@ export function useDesktopState() {
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
       appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
       blockInterruptUntilThreadIsPersisted(threadId)
-      resumedThreadById.value = {
-        ...resumedThreadById.value,
-        [threadId]: true,
-      }
       setSelectedThreadId(threadId)
       shouldAutoScrollOnNextAgentEvent = true
       setTurnSummaryForThread(threadId, null)
@@ -5182,19 +5185,6 @@ export function useDesktopState() {
     })
 
     try {
-      if (resumedThreadById.value[threadId] !== true) {
-        const resumedThread = await resumeThread(threadId)
-        if (resumedThread.model) {
-          setThreadModelId(threadId, resolveThreadModelForProvider(threadId, resumedThread.model, resumedThread.modelProvider))
-        }
-        if (resumedThread.modelProvider) {
-          setThreadModelProviderId(threadId, resumedThread.modelProvider)
-        }
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
-        }
-      }
       const modelId = readModelIdForThread(threadId)
 
       let startedTurnId = ''
@@ -5307,7 +5297,11 @@ export function useDesktopState() {
       }
       pendingThreadMessageRefresh.add(threadId)
       pendingThreadsRefresh = true
-      await syncFromNotifications()
+      try {
+        await syncFromNotifications()
+      } finally {
+        await releaseThreadWriterBestEffort(threadId)
+      }
     } catch (unknownError) {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Failed to interrupt active turn'
       setTurnErrorForThread(threadId, errorMessage)

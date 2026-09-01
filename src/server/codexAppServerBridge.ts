@@ -4933,6 +4933,36 @@ function getCodexGlobalStatePath(): string {
   return join(getCodexHomeDir(), '.codex-global-state.json')
 }
 
+let codexGlobalStateMutation: Promise<void> = Promise.resolve()
+
+async function readCodexGlobalStateForMutation(): Promise<Record<string, unknown>> {
+  const statePath = getCodexGlobalStatePath()
+  try {
+    const parsed = JSON.parse(await readFile(statePath, 'utf8')) as unknown
+    const payload = asRecord(parsed)
+    if (!payload) throw new Error('Codex global state must contain a JSON object')
+    return payload
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    throw error
+  }
+}
+
+function updateCodexGlobalState(
+  updater: (payload: Record<string, unknown>) => void | Promise<void>,
+): Promise<void> {
+  const run = codexGlobalStateMutation.catch(() => undefined).then(async () => {
+    const payload = await readCodexGlobalStateForMutation()
+    await updater(payload)
+    await writeFile(getCodexGlobalStatePath(), JSON.stringify(payload), 'utf8')
+  })
+  codexGlobalStateMutation = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
 function getTelegramBridgeConfigPath(): string {
   return join(getCodexHomeDir(), 'telegram-bridge.json')
 }
@@ -5536,16 +5566,9 @@ async function readThreadTitleCache(): Promise<ThreadTitleCache> {
 }
 
 async function writeThreadTitleCache(cache: ThreadTitleCache): Promise<void> {
-  const statePath = getCodexGlobalStatePath()
-  let payload: Record<string, unknown> = {}
-  try {
-    const raw = await readFile(statePath, 'utf8')
-    payload = asRecord(JSON.parse(raw)) ?? {}
-  } catch {
-    payload = {}
-  }
-  payload['thread-titles'] = cache
-  await writeFile(statePath, JSON.stringify(payload), 'utf8')
+  await updateCodexGlobalState((payload) => {
+    payload['thread-titles'] = cache
+  })
 }
 
 async function readPinnedThreadIds(): Promise<string[]> {
@@ -5560,17 +5583,9 @@ async function readPinnedThreadIds(): Promise<string[]> {
 }
 
 async function writePinnedThreadIds(threadIds: string[]): Promise<void> {
-  const statePath = getCodexGlobalStatePath()
-  let payload: Record<string, unknown> = {}
-  try {
-    const raw = await readFile(statePath, 'utf8')
-    payload = asRecord(JSON.parse(raw)) ?? {}
-  } catch {
-    payload = {}
-  }
-
-  payload[PINNED_THREAD_IDS_KEY] = normalizePinnedThreadIds(threadIds)
-  await writeFile(statePath, JSON.stringify(payload), 'utf8')
+  await updateCodexGlobalState((payload) => {
+    payload[PINNED_THREAD_IDS_KEY] = normalizePinnedThreadIds(threadIds)
+  })
 }
 
 const FIRST_LAUNCH_PLUGINS_CARD_DISMISSED_KEY = 'first-launch-plugins-card-dismissed'
@@ -5675,21 +5690,14 @@ async function readThreadQueueState(): Promise<ThreadQueueState> {
 }
 
 async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promise<void> {
-  const statePath = getCodexGlobalStatePath()
-  let payload: Record<string, unknown> = {}
-  try {
-    const raw = await readFile(statePath, 'utf8')
-    payload = asRecord(JSON.parse(raw)) ?? {}
-  } catch {
-    payload = {}
-  }
   const normalized = normalizeThreadQueueState(nextState)
-  if (Object.keys(normalized).length > 0) {
-    payload[THREAD_QUEUE_STATE_KEY] = normalized
-  } else {
-    delete payload[THREAD_QUEUE_STATE_KEY]
-  }
-  await writeFile(statePath, JSON.stringify(payload), 'utf8')
+  await updateCodexGlobalState((payload) => {
+    if (Object.keys(normalized).length > 0) {
+      payload[THREAD_QUEUE_STATE_KEY] = normalized
+    } else {
+      delete payload[THREAD_QUEUE_STATE_KEY]
+    }
+  })
 }
 
 async function withThreadQueueStateUpdate<T>(
@@ -5823,16 +5831,9 @@ async function readFirstLaunchPluginsCardDismissed(): Promise<boolean> {
 }
 
 async function writeFirstLaunchPluginsCardDismissed(dismissed: boolean): Promise<void> {
-  const statePath = getCodexGlobalStatePath()
-  let payload: Record<string, unknown> = {}
-  try {
-    const raw = await readFile(statePath, 'utf8')
-    payload = asRecord(JSON.parse(raw)) ?? {}
-  } catch {
-    payload = {}
-  }
-  payload[FIRST_LAUNCH_PLUGINS_CARD_DISMISSED_KEY] = dismissed === true
-  await writeFile(statePath, JSON.stringify(payload), 'utf8')
+  await updateCodexGlobalState((payload) => {
+    payload[FIRST_LAUNCH_PLUGINS_CARD_DISMISSED_KEY] = dismissed === true
+  })
 }
 
 function getSessionIndexFileSignature(stats: { mtimeMs: number; size: number }): string {
@@ -6050,21 +6051,12 @@ async function readWorkspaceRootsState(): Promise<WorkspaceRootsState> {
 
 export async function writeWorkspaceRootsState(nextState: WorkspaceRootsState): Promise<void> {
   const state = await canonicalizeWorkspaceRootsState(nextState)
-  const statePath = getCodexGlobalStatePath()
-  let payload: Record<string, unknown> = {}
-  try {
-    const raw = await readFile(statePath, 'utf8')
-    payload = asRecord(JSON.parse(raw)) ?? {}
-  } catch {
-    payload = {}
-  }
-
-  payload['electron-saved-workspace-roots'] = normalizeStringArray(state.order)
-  payload['electron-workspace-root-labels'] = normalizeStringRecord(state.labels)
-  payload['active-workspace-roots'] = normalizeStringArray(state.active)
-  payload['project-order'] = normalizeStringArray(state.projectOrder)
-
-  await writeFile(statePath, JSON.stringify(payload), 'utf8')
+  await updateCodexGlobalState((payload) => {
+    payload['electron-saved-workspace-roots'] = normalizeStringArray(state.order)
+    payload['electron-workspace-root-labels'] = normalizeStringRecord(state.labels)
+    payload['active-workspace-roots'] = normalizeStringArray(state.active)
+    payload['project-order'] = normalizeStringArray(state.projectOrder)
+  })
 }
 
 let workspaceRootsMutation: Promise<void> = Promise.resolve()
@@ -6089,6 +6081,69 @@ async function updateWorkspaceRootsState(
     const existingState = await readWorkspaceRootsState()
     await writeWorkspaceRootsState(updater(existingState))
   })
+}
+
+export async function registerCreatedThreadWithDesktopProjectFromRpc(
+  method: string,
+  params: unknown,
+  result: unknown,
+): Promise<void> {
+  if (method !== 'thread/start' && method !== 'thread/fork') return
+
+  const resultRecord = asRecord(result)
+  const resultThread = asRecord(resultRecord?.thread)
+  const paramsRecord = asRecord(params)
+  const threadId = readNonEmptyString(resultThread?.id) || readNonEmptyString(resultRecord?.threadId)
+  const rawCwd = readNonEmptyString(resultThread?.cwd) || readNonEmptyString(paramsRecord?.cwd)
+  if (!threadId) return
+
+  const cwd = rawCwd ? await canonicalizeWorkspaceRootPath(rawCwd, realpath) : ''
+  await updateCodexGlobalState(async (payload) => {
+    const existingState = await canonicalizeWorkspaceRootsState({
+      order: normalizeStringArray(payload['electron-saved-workspace-roots']),
+      labels: normalizeStringRecord(payload['electron-workspace-root-labels']),
+      active: normalizeStringArray(payload['active-workspace-roots']),
+      projectOrder: normalizeStringArray(payload['project-order']),
+      remoteProjects: normalizeRemoteProjects(payload['remote-projects']),
+      localProjects: normalizeLocalProjects(payload['local-projects']),
+      threadProjectAssignments: normalizeThreadProjectAssignments(payload['thread-project-assignments']),
+      projectlessThreadIds: normalizeStringArray(payload['projectless-thread-ids']),
+    })
+    const matchingProject = (existingState.localProjects ?? []).find((project) => (
+      cwd.length > 0 && project.rootPaths.includes(cwd)
+    ))
+    const threadProjectAssignments = normalizeThreadProjectAssignments(payload['thread-project-assignments'])
+    let projectlessThreadIds = normalizeStringArray(payload['projectless-thread-ids'])
+      .filter((id) => id !== threadId)
+
+    if (matchingProject) {
+      threadProjectAssignments[threadId] = {
+        projectKind: 'local',
+        projectId: matchingProject.id,
+      }
+    } else {
+      delete threadProjectAssignments[threadId]
+      projectlessThreadIds = prependUniqueString(threadId, projectlessThreadIds)
+    }
+
+    payload['thread-project-assignments'] = threadProjectAssignments
+    payload['projectless-thread-ids'] = projectlessThreadIds
+  })
+}
+
+export async function registerCreatedThreadWithDesktopProjectFromRpcBestEffort(
+  method: string,
+  params: unknown,
+  result: unknown,
+): Promise<void> {
+  try {
+    await registerCreatedThreadWithDesktopProjectFromRpc(method, params, result)
+  } catch (error) {
+    console.warn(
+      '[thread-project-registration] failed to register created thread with Desktop project',
+      getErrorMessage(error, 'Unknown Desktop project registration error'),
+    )
+  }
 }
 
 async function persistWorkspaceRoot(workspaceRoot: string, label = ''): Promise<void> {
@@ -7034,13 +7089,150 @@ class AppServerProcess {
   }
 }
 
+type ThreadWriterAppServer = {
+  rpc: (method: string, params: unknown) => Promise<unknown>
+  onNotification: (listener: (value: { method: string; params: unknown }) => void) => () => void
+}
+
+type ThreadWriterCoordinatorOptions = {
+  hasQueuedTurns: (threadId: string) => Promise<boolean>
+}
+
+export class ThreadWriterCoordinator {
+  private readonly operationByThreadId = new Map<string, Promise<unknown>>()
+  private readonly ownedThreadIds = new Set<string>()
+  private readonly activeThreadIds = new Set<string>()
+  private readonly unsubscribeNotification: () => void
+
+  constructor(
+    private readonly appServer: ThreadWriterAppServer,
+    private readonly options: ThreadWriterCoordinatorOptions,
+  ) {
+    this.unsubscribeNotification = appServer.onNotification((notification) => {
+      const threadId = extractThreadIdFromNotificationParams(notification.params)
+      if (!threadId) return
+      if (notification.method === 'turn/started') {
+        this.ownedThreadIds.add(threadId)
+        this.activeThreadIds.add(threadId)
+      } else if (notification.method === 'turn/completed') {
+        void this.handleTurnCompleted(threadId)
+      }
+    })
+  }
+
+  dispose(): void {
+    this.unsubscribeNotification()
+    this.operationByThreadId.clear()
+    this.ownedThreadIds.clear()
+    this.activeThreadIds.clear()
+  }
+
+  noteWriterOwned(threadId: string): void {
+    const normalizedThreadId = threadId.trim()
+    if (normalizedThreadId) this.ownedThreadIds.add(normalizedThreadId)
+  }
+
+  async runExclusive<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) throw new Error('Missing threadId')
+    const previous = this.operationByThreadId.get(normalizedThreadId) ?? Promise.resolve()
+    const run = previous.catch(() => undefined).then(operation)
+    this.operationByThreadId.set(normalizedThreadId, run)
+    try {
+      return await run
+    } finally {
+      if (this.operationByThreadId.get(normalizedThreadId) === run) {
+        this.operationByThreadId.delete(normalizedThreadId)
+      }
+    }
+  }
+
+  async startTurn(params: Record<string, unknown>): Promise<unknown> {
+    const threadId = readNonEmptyString(params.threadId)
+    if (!threadId) throw new Error('Missing threadId')
+    return this.runExclusive(threadId, async () => this.startTurnLocked(threadId, params))
+  }
+
+  async startTurnLocked(threadId: string, params: Record<string, unknown>): Promise<unknown> {
+    if (this.activeThreadIds.has(threadId)) {
+      throw new Error(`thread ${threadId} already has an active turn`)
+    }
+    if (!this.ownedThreadIds.has(threadId)) {
+      await this.appServer.rpc('thread/resume', { threadId })
+      this.ownedThreadIds.add(threadId)
+    }
+    this.activeThreadIds.add(threadId)
+    try {
+      return await this.appServer.rpc('turn/start', params)
+    } catch (error) {
+      this.activeThreadIds.delete(threadId)
+      await this.releaseLocked(threadId)
+      throw error
+    }
+  }
+
+  async release(threadId: string): Promise<void> {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+    await this.runExclusive(normalizedThreadId, async () => {
+      await this.releaseLocked(normalizedThreadId)
+    })
+  }
+
+  async handleTurnCompleted(threadId: string): Promise<void> {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+    this.activeThreadIds.delete(normalizedThreadId)
+    await this.release(normalizedThreadId)
+  }
+
+  private async releaseLocked(threadId: string): Promise<void> {
+    if (!this.ownedThreadIds.has(threadId) || this.activeThreadIds.has(threadId)) return
+    if (await this.options.hasQueuedTurns(threadId)) return
+    await this.appServer.rpc('thread/unsubscribe', { threadId })
+    this.ownedThreadIds.delete(threadId)
+  }
+}
+
+export async function dispatchBridgeRpc(
+  appServer: RpcExecutor,
+  threadWriterCoordinator: ThreadWriterCoordinator,
+  method: string,
+  params: unknown,
+): Promise<unknown> {
+  const paramsRecord = asRecord(params) ?? {}
+  if (method === 'codex-ui/turn/start' || method === 'turn/start') {
+    return threadWriterCoordinator.startTurn(paramsRecord)
+  }
+  if (method === 'codex-ui/thread/release') {
+    const threadId = readNonEmptyString(paramsRecord.threadId)
+    if (!threadId) throw new Error('Missing threadId')
+    await threadWriterCoordinator.release(threadId)
+    return { status: 'released' }
+  }
+
+  const result = await callRpcWithArchiveRecovery(appServer, method, params ?? null)
+  if (method === 'thread/start' || method === 'thread/fork' || method === 'thread/resume') {
+    const resultRecord = asRecord(result)
+    const resultThread = asRecord(resultRecord?.thread)
+    const threadId = readNonEmptyString(resultThread?.id)
+      || readNonEmptyString(resultRecord?.threadId)
+      || readNonEmptyString(paramsRecord.threadId)
+    if (threadId) threadWriterCoordinator.noteWriterOwned(threadId)
+  }
+  return result
+}
+
 export class BackendQueueProcessor {
   private readonly processingThreadIds = new Set<string>()
   private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
   private readonly unsubscribe: () => void
 
-  constructor(private readonly appServer: AppServerProcess) {
+  constructor(
+    private readonly appServer: AppServerProcess,
+    private readonly threadWriterCoordinator: ThreadWriterCoordinator,
+  ) {
     this.unsubscribe = appServer.onNotification((notification) => {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
@@ -7097,22 +7289,24 @@ export class BackendQueueProcessor {
     if (this.processingThreadIds.has(threadId)) return
     this.processingThreadIds.add(threadId)
     try {
-      const canStart = await this.canStartQueuedTurn(threadId)
-      if (!canStart) {
-        if (await this.hasQueuedTurns(threadId)) {
-          this.scheduleThreadQueueDrain(threadId)
+      let shouldScheduleAnotherDrain = false
+      await this.threadWriterCoordinator.runExclusive(threadId, async () => {
+        const canStart = await this.canStartQueuedTurn(threadId)
+        if (!canStart) {
+          shouldScheduleAnotherDrain = await this.hasQueuedTurns(threadId)
+          return
         }
-        return
-      }
-      const next = await this.popNextQueuedTurn(threadId)
-      if (!next) return
-      try {
-        await this.startQueuedTurn(next)
-        if (await this.hasQueuedTurns(threadId)) {
-          this.scheduleThreadQueueDrain(threadId)
+        const next = await this.popNextQueuedTurn(threadId)
+        if (!next) return
+        try {
+          await this.startQueuedTurn(next)
+          shouldScheduleAnotherDrain = await this.hasQueuedTurns(threadId)
+        } catch {
+          await this.restoreQueuedTurn(next)
+          shouldScheduleAnotherDrain = true
         }
-      } catch {
-        await this.restoreQueuedTurn(next)
+      })
+      if (shouldScheduleAnotherDrain) {
         this.scheduleThreadQueueDrain(threadId)
       }
     } catch {
@@ -7272,8 +7466,10 @@ export class BackendQueueProcessor {
   }
 
   private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
-    await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
+    await this.threadWriterCoordinator.startTurnLocked(
+      turn.threadId,
+      await this.buildQueuedTurnParams(turn),
+    )
   }
 }
 
@@ -7405,6 +7601,7 @@ type SharedBridgeState = {
   terminalManager: ThreadTerminalManager
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
+  threadWriterCoordinator: ThreadWriterCoordinator
   backendQueueProcessor: BackendQueueProcessor
   desktopStateCoordinator: DesktopStateCoordinator
   unsubscribeDesktopStateSource: () => void
@@ -7412,7 +7609,7 @@ type SharedBridgeState = {
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v3'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v4'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7426,6 +7623,7 @@ function getSharedBridgeState(): SharedBridgeState {
     }
     existing.appServer.dispose()
     existing.backendQueueProcessor?.dispose()
+    existing.threadWriterCoordinator?.dispose()
     existing.terminalManager?.dispose()
     existing.unsubscribeDesktopStateSource?.()
     existing.unsubscribeProcessHealthSource?.()
@@ -7434,7 +7632,13 @@ function getSharedBridgeState(): SharedBridgeState {
 
   const appServer = new AppServerProcess()
   const terminalManager = new ThreadTerminalManager()
-  const backendQueueProcessor = new BackendQueueProcessor(appServer)
+  const threadWriterCoordinator = new ThreadWriterCoordinator(appServer, {
+    hasQueuedTurns: async (threadId) => {
+      const queue = (await readThreadQueueState())[threadId]
+      return Array.isArray(queue) && queue.length > 0
+    },
+  })
+  const backendQueueProcessor = new BackendQueueProcessor(appServer, threadWriterCoordinator)
   const desktopStateCoordinator = new DesktopStateCoordinator({ codexHome: getCodexHomeDir() })
   const unsubscribeDesktopStateSource = appServer.onNotification((notification) => {
     desktopStateCoordinator.noteNativeNotification(notification)
@@ -7457,6 +7661,7 @@ function getSharedBridgeState(): SharedBridgeState {
         void rememberTelegramChatId(chatId).catch(() => {})
       },
     }),
+    threadWriterCoordinator,
   }
   globalScope[SHARED_BRIDGE_KEY] = created
   return created
@@ -7544,6 +7749,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     terminalManager,
     methodCatalog,
     telegramBridge,
+    threadWriterCoordinator,
     backendQueueProcessor,
     desktopStateCoordinator,
   } = getSharedBridgeState()
@@ -8052,7 +8258,12 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
         let rpcResult: unknown
         try {
-          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
+          rpcResult = await dispatchBridgeRpc(
+            appServer,
+            threadWriterCoordinator,
+            body.method,
+            body.params ?? null,
+          )
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })
@@ -8096,6 +8307,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const result = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? await mergeSessionSkillInputsIntoThreadResult(sanitizedResult)
           : sanitizedResult
+
+        await registerCreatedThreadWithDesktopProjectFromRpcBestEffort(body.method, body.params, result)
 
 	        if (THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(body.method)) {
 	          const rpcRecord = asRecord(result)
@@ -9737,6 +9950,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
+    threadWriterCoordinator.dispose()
     desktopStateCoordinator.stop()
     appServer.dispose()
   }

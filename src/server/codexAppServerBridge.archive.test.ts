@@ -7,12 +7,16 @@ import {
   callRpcWithArchiveRecovery,
   canonicalizeThreadListResponseForRead,
   canonicalizeWorkspaceRootsStateForRead,
+  dispatchBridgeRpc,
   ensureDefaultFreeModeStateForMissingAuthSync,
   hasUsableCodexAuth,
   isEmptyThreadReadError,
   isThreadMaterializationPendingError,
   isThreadNotFoundError,
   isUnauthenticatedRateLimitError,
+  registerCreatedThreadWithDesktopProjectFromRpc,
+  registerCreatedThreadWithDesktopProjectFromRpcBestEffort,
+  ThreadWriterCoordinator,
   writeFreeModeStateFile,
   writeWorkspaceRootsState,
 } from './codexAppServerBridge'
@@ -264,6 +268,267 @@ describe('writeWorkspaceRootsState', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true })
     }
+  })
+})
+
+describe('registerCreatedThreadWithDesktopProjectFromRpc', () => {
+  it('does not replace malformed Desktop global state with an empty payload', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-home-thread-project-malformed-'))
+    process.env.CODEX_HOME = codexHome
+    const statePath = join(codexHome, '.codex-global-state.json')
+
+    try {
+      await writeFile(statePath, '{malformed', 'utf8')
+
+      await expect(registerCreatedThreadWithDesktopProjectFromRpc(
+        'thread/start',
+        { cwd: '/workspace/alpha' },
+        { thread: { id: 'thread-alpha', cwd: '/workspace/alpha' } },
+      )).rejects.toThrow()
+      await expect(readFile(statePath, 'utf8')).resolves.toBe('{malformed')
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a successful thread creation usable when Desktop project registration fails', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-home-thread-project-best-effort-'))
+    process.env.CODEX_HOME = codexHome
+    const statePath = join(codexHome, '.codex-global-state.json')
+
+    try {
+      await writeFile(statePath, '{malformed', 'utf8')
+
+      await expect(registerCreatedThreadWithDesktopProjectFromRpcBestEffort(
+        'thread/start',
+        { cwd: '/workspace/alpha' },
+        { thread: { id: 'thread-alpha', cwd: '/workspace/alpha' } },
+      )).resolves.toBeUndefined()
+      await expect(readFile(statePath, 'utf8')).resolves.toBe('{malformed')
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('atomically assigns matching threads and records unmatched threads as projectless', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-home-thread-project-registration-'))
+    process.env.CODEX_HOME = codexHome
+
+    try {
+      const localProjects = {
+        'local-alpha': {
+          id: 'local-alpha',
+          name: 'Alpha',
+          rootPaths: ['/workspace/alpha'],
+          createdAt: 100,
+          updatedAt: 200,
+        },
+      }
+      await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+        'local-projects': localProjects,
+        'thread-project-assignments': {
+          'existing-thread': { projectKind: 'local', projectId: 'local-alpha' },
+        },
+        'projectless-thread-ids': ['existing-projectless'],
+      }), 'utf8')
+
+      await Promise.all([
+        registerCreatedThreadWithDesktopProjectFromRpc(
+          'thread/start',
+          { cwd: '/workspace/alpha' },
+          { thread: { id: 'thread-alpha', cwd: '/workspace/alpha' } },
+        ),
+        registerCreatedThreadWithDesktopProjectFromRpc(
+          'thread/start',
+          { cwd: '/workspace/other' },
+          { thread: { id: 'thread-projectless', cwd: '/workspace/other' } },
+        ),
+      ])
+
+      const rawState = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
+      expect(Object.keys(rawState).sort()).toEqual([
+        'local-projects',
+        'projectless-thread-ids',
+        'thread-project-assignments',
+      ])
+      expect(rawState['local-projects']).toEqual(localProjects)
+      expect(rawState['thread-project-assignments']).toEqual({
+        'existing-thread': { projectKind: 'local', projectId: 'local-alpha' },
+        'thread-alpha': { projectKind: 'local', projectId: 'local-alpha' },
+      })
+      expect(rawState['projectless-thread-ids']).toEqual([
+        'thread-projectless',
+        'existing-projectless',
+      ])
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('ThreadWriterCoordinator', () => {
+  it('releases ownership when a turn completes before turn/start returns', async () => {
+    const calls: string[] = []
+    let notificationListener: ((value: { method: string; params: unknown }) => void) | undefined
+    const appServer = {
+      async rpc(method: string): Promise<unknown> {
+        calls.push(method)
+        if (method === 'thread/resume') return { thread: { id: 'fast-thread' } }
+        if (method === 'turn/start') {
+          notificationListener?.({
+            method: 'turn/completed',
+            params: { threadId: 'fast-thread', turn: { id: 'turn-fast', status: 'completed' } },
+          })
+          return { turn: { id: 'turn-fast' } }
+        }
+        if (method === 'thread/unsubscribe') return { status: 'unsubscribed' }
+        throw new Error(`unexpected method ${method}`)
+      },
+      onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
+        notificationListener = listener
+        return () => undefined
+      },
+    }
+    const coordinator = new ThreadWriterCoordinator(appServer, {
+      hasQueuedTurns: async () => false,
+    })
+
+    await coordinator.startTurn({ threadId: 'fast-thread', input: [] })
+    await coordinator.release('fast-thread')
+
+    expect(calls).toEqual(['thread/resume', 'turn/start', 'thread/unsubscribe'])
+    coordinator.dispose()
+  })
+
+  it('dispatches atomic turn starts and server-controlled releases', async () => {
+    const calls: Array<{ method: string; params: unknown }> = []
+    const appServer = {
+      async rpc(method: string, params: unknown): Promise<unknown> {
+        calls.push({ method, params })
+        if (method === 'thread/resume') return { thread: { id: 'shared-thread' } }
+        if (method === 'turn/start') return { turn: { id: 'turn-1' } }
+        if (method === 'thread/unsubscribe') return { status: 'unsubscribed' }
+        throw new Error(`unexpected method ${method}`)
+      },
+      onNotification(): () => void {
+        return () => undefined
+      },
+    }
+    const coordinator = new ThreadWriterCoordinator(appServer, {
+      hasQueuedTurns: async () => false,
+    })
+
+    await expect(dispatchBridgeRpc(
+      appServer,
+      coordinator,
+      'codex-ui/turn/start',
+      { threadId: 'shared-thread', input: [] },
+    )).resolves.toEqual({ turn: { id: 'turn-1' } })
+    await coordinator.handleTurnCompleted('shared-thread')
+
+    expect(calls.map((call) => call.method)).toEqual([
+      'thread/resume',
+      'turn/start',
+      'thread/unsubscribe',
+    ])
+    coordinator.dispose()
+  })
+
+  it.each([
+    ['thread/start', {}, { thread: { id: 'started-thread' } }, 'started-thread'],
+    ['thread/fork', { threadId: 'source-thread' }, { thread: { id: 'forked-thread' } }, 'forked-thread'],
+    ['thread/resume', { threadId: 'resumed-thread' }, { thread: { id: 'resumed-thread' } }, 'resumed-thread'],
+  ])('tracks writer ownership acquired by %s', async (method, params, result, threadId) => {
+    const calls: Array<{ method: string; params: unknown }> = []
+    const appServer = {
+      async rpc(nextMethod: string, nextParams: unknown): Promise<unknown> {
+        calls.push({ method: nextMethod, params: nextParams })
+        if (nextMethod === method) return result
+        if (nextMethod === 'thread/unsubscribe') return { status: 'unsubscribed' }
+        throw new Error(`unexpected method ${nextMethod}`)
+      },
+      onNotification(): () => void {
+        return () => undefined
+      },
+    }
+    const coordinator = new ThreadWriterCoordinator(appServer, {
+      hasQueuedTurns: async () => false,
+    })
+
+    await dispatchBridgeRpc(appServer, coordinator, method, params)
+    await dispatchBridgeRpc(appServer, coordinator, 'codex-ui/thread/release', { threadId })
+
+    expect(calls.map((call) => call.method)).toEqual([method, 'thread/unsubscribe'])
+    coordinator.dispose()
+  })
+
+  it('serializes release behind a starting turn and defers unsubscribe while active', async () => {
+    const calls: Array<{ method: string; params: unknown }> = []
+    let finishTurnStart: (() => void) | undefined
+    const turnStartGate = new Promise<void>((resolve) => {
+      finishTurnStart = resolve
+    })
+    const appServer = {
+      async rpc(method: string, params: unknown): Promise<unknown> {
+        calls.push({ method, params })
+        if (method === 'turn/start') {
+          await turnStartGate
+          return { turn: { id: 'turn-1' } }
+        }
+        if (method === 'thread/resume') return { thread: { id: 'shared-thread' } }
+        if (method === 'thread/unsubscribe') return { status: 'unsubscribed' }
+        throw new Error(`unexpected method ${method}`)
+      },
+      onNotification(): () => void {
+        return () => undefined
+      },
+    }
+    const coordinator = new ThreadWriterCoordinator(appServer, {
+      hasQueuedTurns: async () => false,
+    })
+
+    const start = coordinator.startTurn({ threadId: 'shared-thread', input: [] })
+    for (let index = 0; index < 5 && calls.length < 2; index += 1) await Promise.resolve()
+    const release = coordinator.release('shared-thread')
+    finishTurnStart?.()
+    await start
+    await release
+
+    expect(calls.map((call) => call.method)).toEqual(['thread/resume', 'turn/start'])
+
+    await coordinator.handleTurnCompleted('shared-thread')
+    expect(calls.map((call) => call.method)).toEqual([
+      'thread/resume',
+      'turn/start',
+      'thread/unsubscribe',
+    ])
+    coordinator.dispose()
+  })
+
+  it('keeps ownership until the authoritative server queue is empty', async () => {
+    const calls: string[] = []
+    let hasQueuedTurns = true
+    const appServer = {
+      async rpc(method: string): Promise<unknown> {
+        calls.push(method)
+        return { status: 'unsubscribed' }
+      },
+      onNotification(): () => void {
+        return () => undefined
+      },
+    }
+    const coordinator = new ThreadWriterCoordinator(appServer, {
+      hasQueuedTurns: async () => hasQueuedTurns,
+    })
+    coordinator.noteWriterOwned('queued-thread')
+
+    await coordinator.handleTurnCompleted('queued-thread')
+    expect(calls).toEqual([])
+
+    hasQueuedTurns = false
+    await coordinator.release('queued-thread')
+    expect(calls).toEqual(['thread/unsubscribe'])
+    coordinator.dispose()
   })
 })
 

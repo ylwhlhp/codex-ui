@@ -31,6 +31,7 @@ const gatewayMocks = vi.hoisted(() => ({
   persistThreadTitle: vi.fn(),
   renameThread: vi.fn(),
   replyToServerRequest: vi.fn(),
+  releaseThreadWriter: vi.fn(),
   resumeThread: vi.fn(),
   revertThreadFileChanges: vi.fn(),
   rollbackThread: vi.fn(),
@@ -82,7 +83,9 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  gatewayMocks.releaseThreadWriter.mockResolvedValue(undefined)
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
   gatewayMocks.getAppServerHealth.mockResolvedValue({
@@ -188,6 +191,38 @@ describe('filterGroupsByWorkspaceRoots', () => {
       ['local-alpha', [['thread-alpha', 'local-alpha']]],
       ['Projectless', [['thread-projectless', 'Projectless']]],
       ['local-empty', []],
+    ])
+  })
+
+  it('keeps unassigned threads whose cwd matches a Desktop local project root', () => {
+    const groups: UiProjectGroup[] = [
+      {
+        projectName: 'alpha',
+        threads: [
+          thread('assigned-thread', '/workspace/alpha'),
+          thread('legacy-thread', '/workspace/alpha'),
+        ],
+      },
+    ]
+    const rootsState: WorkspaceRootsState = {
+      order: [],
+      labels: {},
+      active: [],
+      projectOrder: ['local-alpha'],
+      localProjects: [
+        { id: 'local-alpha', name: 'Alpha', rootPaths: ['/workspace/alpha'] },
+      ],
+      threadProjectAssignments: {
+        'assigned-thread': { projectKind: 'local', projectId: 'local-alpha' },
+      },
+      projectlessThreadIds: [],
+    }
+
+    expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => [
+      group.projectName,
+      group.threads.map((row) => row.id),
+    ])).toEqual([
+      ['local-alpha', ['assigned-thread', 'legacy-thread']],
     ])
   })
 
@@ -974,6 +1009,26 @@ describe('startup request deduplication', () => {
 })
 
 describe('live error overlay', () => {
+  it('loads a thread passively without acquiring its active writer', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('desktop-thread')
+    await state.loadMessages('desktop-thread')
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('desktop-thread')
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+  })
+
   it('shows the default thinking overlay while a selected thread is in progress without activity events', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])
@@ -1092,6 +1147,128 @@ describe('live error overlay', () => {
     })
 
     expect(state.selectedLiveOverlay.value).toBe(null)
+  })
+})
+
+describe('thread writer handoff', () => {
+  it('leaves turn-completion release decisions to the server coordinator', async () => {
+    installImmediateTimers()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-1')
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('queued-thread')
+    await state.sendMessageToSelectedThread('first turn')
+    await state.sendMessageToSelectedThread('queued turn', [], [], 'queue')
+    state.startPolling()
+    notificationHandler?.({
+      method: 'turn/completed',
+      params: {
+        threadId: 'queued-thread',
+        turn: { id: 'turn-1', status: 'completed' },
+      },
+    })
+    await flushRealtimeTasks()
+
+    expect(gatewayMocks.releaseThreadWriter).not.toHaveBeenCalled()
+
+    notificationHandler?.({
+      method: 'turn/started',
+      params: {
+        threadId: 'queued-thread',
+        turn: { id: 'turn-2', status: 'inProgress' },
+      },
+    })
+    notificationHandler?.({
+      method: 'turn/completed',
+      params: {
+        threadId: 'queued-thread',
+        turn: { id: 'turn-2', status: 'completed' },
+      },
+    })
+    await flushRealtimeTasks()
+
+    expect(gatewayMocks.releaseThreadWriter).not.toHaveBeenCalled()
+  })
+
+  it('releases a newly forked thread after its initial setup', async () => {
+    installTestWindow()
+    gatewayMocks.forkThread.mockResolvedValue({
+      threadId: 'forked-thread',
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    await expect(state.forkThreadById('source-thread')).resolves.toBe('forked-thread')
+
+    expect(gatewayMocks.releaseThreadWriter).toHaveBeenCalledWith('forked-thread')
+  })
+
+  it('releases a turn-level fork after rollback setup completes', async () => {
+    installTestWindow()
+    const sourceMessages = [{
+      id: 'assistant-source',
+      role: 'assistant' as const,
+      text: 'source response',
+      messageType: 'agentMessage',
+      turnId: 'turn-source',
+      turnIndex: 0,
+    }]
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: sourceMessages,
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: { 'turn-source': 0 },
+    })
+    gatewayMocks.forkThread.mockResolvedValue({
+      threadId: 'turn-fork',
+      cwd: '/tmp/project',
+      model: 'gpt-5.5',
+      messages: sourceMessages,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('source-thread')
+    await state.loadMessages('source-thread')
+    await expect(state.forkThreadFromTurn('source-thread', 0)).resolves.toBe('turn-fork')
+
+    expect(gatewayMocks.releaseThreadWriter).toHaveBeenCalledWith('turn-fork')
   })
 })
 
@@ -1266,7 +1443,7 @@ describe('provider model selection', () => {
       }
       return ['gpt-5.5', 'gpt-5.4-mini']
     })
-    gatewayMocks.resumeThread.mockResolvedValue({
+    gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.4-mini',
       modelProvider: 'opencode_zen',
       messages: [],
@@ -1322,7 +1499,7 @@ describe('provider model selection', () => {
       }
       return ['gpt-5.5', 'gpt-5.4-mini']
     })
-    gatewayMocks.resumeThread.mockResolvedValue({
+    gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.4-mini',
       modelProvider: 'opencode_zen',
       messages: [],
@@ -1507,7 +1684,7 @@ describe('provider model selection', () => {
       speedMode: 'standard',
     })
     gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5', 'gpt-5.4-mini'])
-    gatewayMocks.resumeThread.mockRejectedValue(new Error('thread not found'))
+    gatewayMocks.getThreadDetail.mockRejectedValue(new Error('thread not found'))
 
     const state = useDesktopState()
     state.primeSelectedThread('missing-thread')
@@ -1522,7 +1699,7 @@ describe('provider model selection', () => {
 
     await state.ensureThreadMessagesLoaded('missing-thread', { silent: true })
     await state.loadMessages('missing-thread')
-    expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
   })
 })
 

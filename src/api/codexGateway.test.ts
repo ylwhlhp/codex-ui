@@ -5,6 +5,7 @@ import {
   getThreadDetail,
   getWorkspaceRootsState,
   listDirectoryComposioConnectors,
+  releaseThreadWriter,
   resumeThread,
   startThreadTurn,
   subscribeCodexNotifications,
@@ -103,7 +104,7 @@ describe('startThreadTurn collaboration mode payloads', () => {
     await startThreadTurn('thread-1', 'implement it', [], 'gpt-5.4', 'medium', undefined, [], 'default')
 
     expect(requests).toHaveLength(2)
-    expect(requests[0].method).toBe('turn/start')
+    expect(requests[0].method).toBe('codex-ui/turn/start')
     expect(requests[0].params.collaborationMode).toEqual({
       mode: 'plan',
       settings: {
@@ -112,7 +113,7 @@ describe('startThreadTurn collaboration mode payloads', () => {
         developer_instructions: null,
       },
     })
-    expect(requests[1].method).toBe('turn/start')
+    expect(requests[1].method).toBe('codex-ui/turn/start')
     expect(requests[1].params.collaborationMode).toEqual({
       mode: 'default',
       settings: {
@@ -326,7 +327,7 @@ describe('resumeThread', () => {
     ])
   })
 
-  it('falls back to thread/read when another shared client already owns the active writer', async () => {
+  it('surfaces an active writer conflict without falling back to a passive read', async () => {
     const requests: Array<{ method: string; params: Record<string, unknown> }> = []
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
@@ -358,14 +359,9 @@ describe('resumeThread', () => {
       })
     }))
 
-    await expect(resumeThread('shared-thread')).resolves.toMatchObject({
-      model: 'gpt-5.6-sol',
-      modelProvider: 'openai',
-      messages: [],
-    })
+    await expect(resumeThread('shared-thread')).rejects.toThrow('already has an active writer')
     expect(requests).toEqual([
       { method: 'thread/resume', params: { threadId: 'shared-thread' } },
-      { method: 'thread/read', params: { threadId: 'shared-thread', includeTurns: true } },
     ])
   })
 
@@ -391,6 +387,34 @@ describe('resumeThread', () => {
     expect(requests).toEqual([
       { method: 'thread/resume', params: { threadId: 'stalled-thread' } },
       { method: 'thread/resume', params: { threadId: 'stalled-thread' } },
+    ])
+  })
+
+  it('releases the writer through the bridge coordinator and reacquires it on the next resume', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+      return new Response(JSON.stringify({
+        result: body.method === 'codex-ui/thread/release'
+          ? { status: 'unsubscribed' }
+          : { thread: { id: 'handoff-thread', turns: [] } },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await resumeThread('handoff-thread')
+    await releaseThreadWriter('handoff-thread')
+    await resumeThread('handoff-thread')
+
+    expect(requests).toEqual([
+      { method: 'thread/resume', params: { threadId: 'handoff-thread' } },
+      { method: 'codex-ui/thread/release', params: { threadId: 'handoff-thread' } },
+      { method: 'thread/resume', params: { threadId: 'handoff-thread' } },
     ])
   })
 })
